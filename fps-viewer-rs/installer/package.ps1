@@ -3,8 +3,8 @@
 #
 #   pwsh installer/package.ps1 [-Exe target/x86_64-pc-windows-msvc/release/FpsViewer.exe]
 #
-# The version comes from Cargo.toml. Needs NSIS (makensis) — preinstalled on GitHub's
-# Windows runners, otherwise `choco install nsis` or `winget install NSIS.NSIS`.
+# The version comes from Cargo.toml. Needs NSIS (makensis): `choco install nsis` (as the
+# workflows do) or `winget install NSIS.NSIS`.
 param(
     [string]$Exe = "target/x86_64-pc-windows-msvc/release/FpsViewer.exe"
 )
