@@ -1,0 +1,8 @@
+# Link the C runtime statically so the .exe needs nothing but Windows itself
+# (no Visual C++ Redistributable).
+# /IGNORE:4099 silences "no PDB for the static CRT" linker noise.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/IGNORE:4099"]
