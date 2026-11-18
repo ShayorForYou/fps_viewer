@@ -2,11 +2,14 @@
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
   <assemblyIdentity version="1.0.0.0" name="FpsViewer.app"/>
 
-  <!-- Reading GPU present events via ETW requires an elevated process. -->
+  <!-- Reading GPU present events via ETW requires an elevated process, but the exe starts
+       as the user: main.rs then hands off to the installed app's "FPS Viewer Launcher"
+       scheduled task (elevated, no UAC prompt) or, failing that, relaunches itself with a
+       normal UAC prompt. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

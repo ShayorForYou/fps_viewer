@@ -48,15 +48,48 @@ cargo build --release
 
 ### Run
 
-The app needs administrator rights (the manifest asks for them), because Windows only lets
-elevated processes open real-time ETW sessions. Run `FpsViewer.exe` and accept the UAC prompt;
-`FpsViewer.exe --background` starts silently to the tray (used by "Start with Windows").
+Windows only lets elevated processes open real-time ETW sessions, so the app runs as
+administrator. The manifest is `asInvoker`; `main.rs` elevates on start:
+
+| Started from | What happens |
+|---|---|
+| Program Files (installed) | Runs the **FPS Viewer Launcher** scheduled task → elevated, no UAC prompt |
+| Anywhere else (portable) | Relaunches itself with `runas` → the usual UAC prompt |
+
+The scheduled tasks (launcher, and "FPS Viewer" for *Start with Windows*) are only ever
+registered for an exe under Program Files: they start it elevated without asking, which is
+only safe when non-admins can't replace the file.
+
+Command line:
+
+| | |
+|---|---|
+| `--background` | Start silently to the tray (used by *Start with Windows*) |
+| `--install [--startup \| --no-startup]` | Register the launch task, and set *Start with Windows* (installer) |
+| `--uninstall` | Remove both scheduled tasks (uninstaller) |
+
+## Packaging
+
+```bash
+./release.sh              # build + sign with the local test certificate (~/.fpsviewer-signing)
+./release.sh --unsigned   # build for a public release
+```
+
+Both produce `dist/FpsViewer-x64.exe` (portable), `dist/FpsViewer-Setup-x64.exe` (NSIS
+installer, `installer/FpsViewer.nsi`; needs `brew install makensis`) and `SHA256SUMS.txt`.
+On Windows and in CI, `installer/package.ps1` packages an already-built exe the same way.
+Releases are published by GitHub Actions from the `production` branch, as described in the
+root README.
 
 ## Layout
 
 ```
+installer/
+├─ FpsViewer.nsi    NSIS installer: Program Files, Start menu, Apps entry, scheduled tasks
+└─ package.ps1      Windows/CI packaging (portable exe + installer + checksums)
+release.sh          macOS/Linux build + package (+ optional test signing)
 src/
-├─ main.rs          Entry point, single-instance guard
+├─ main.rs          Entry point, elevation hand-off, installer command line, single-instance guard
 ├─ app.rs           App state, message loop, hotkeys, focus tracking, power/display events
 ├─ etw.rs           ETW real-time session; kernel-filtered present events; lock-light callback
 ├─ stats.rs         FPS, frame time, graph buckets — zero allocations per update

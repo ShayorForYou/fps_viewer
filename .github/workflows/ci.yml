@@ -1,0 +1,54 @@
+# Builds every push to main and every pull request on Windows, and keeps the portable exe
+# and the installer as a downloadable artifact (Actions → this run → Artifacts) for testing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: fps-viewer-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fps-viewer-rs
+
+      - name: Clippy
+        run: cargo clippy --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package (exe + installer)
+        id: pkg
+        run: ./installer/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FpsViewer-${{ steps.pkg.outputs.version }}-${{ github.sha }}
+          path: |
+            fps-viewer-rs/dist/FpsViewer-x64.exe
+            fps-viewer-rs/dist/FpsViewer-Setup-x64.exe
+            fps-viewer-rs/dist/SHA256SUMS.txt
+          retention-days: 14

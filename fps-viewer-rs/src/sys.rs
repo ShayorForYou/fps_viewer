@@ -7,7 +7,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCSTR, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, FILETIME, HANDLE, HWND, RECT};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath, ShellExecuteExW, KNOWN_FOLDER_FLAG,
+    SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, ASFW_ANY, SW_SHOWNORMAL};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS, MONITORINFO,
     MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
@@ -18,7 +25,7 @@ use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetSystemTimes, OpenProcess, ProcessPowerThrottling, QueryFullProcessImageNameW, SetPriorityClass,
+    GetCurrentProcess, GetSystemTimes, OpenProcess, OpenProcessToken, ProcessPowerThrottling, QueryFullProcessImageNameW, SetPriorityClass,
     SetProcessInformation, BELOW_NORMAL_PRIORITY_CLASS, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -225,14 +232,133 @@ pub fn enable_dark_menus() {
 /// Because the app needs elevation, a Run-key entry would be blocked by UAC at sign-in;
 /// a scheduled task with highest privileges launches silently instead.
 const TASK_NAME: &str = "FPS Viewer";
+/// The on-demand twin of the startup task (no trigger). Opening the installed app — Start
+/// menu, double-click — runs this task, so it starts elevated without a UAC prompt.
+const LAUNCH_TASK_NAME: &str = "FPS Viewer Launcher";
 
 pub fn startup_is_enabled() -> bool {
-    run_schtasks(&["/Query", "/TN", TASK_NAME]) == Some(0)
+    task_exists(TASK_NAME)
 }
 
+/// Fails (returns false) when enabling from a location ordinary programs can write to.
 pub fn startup_set_enabled(enabled: bool) -> bool {
     if !enabled {
-        return run_schtasks(&["/Delete", "/F", "/TN", TASK_NAME]) == Some(0) || !startup_is_enabled();
+        return delete_task(TASK_NAME);
+    }
+    register_task(TASK_NAME, "Starts the FPS Viewer overlay when you sign in.", true, "--background")
+}
+
+/// Registers the on-demand launch task. Installed copies only.
+pub fn launcher_register() -> bool {
+    register_task(
+        LAUNCH_TASK_NAME,
+        "Opens FPS Viewer with the administrator rights it needs to read frame timings, without a UAC prompt.",
+        false,
+        "",
+    )
+}
+
+/// Removes both tasks (used by the uninstaller). True when neither is left.
+pub fn remove_tasks() -> bool {
+    let a = delete_task(LAUNCH_TASK_NAME);
+    let b = delete_task(TASK_NAME);
+    a && b
+}
+
+fn task_exists(name: &str) -> bool {
+    run_schtasks(&["/Query", "/TN", name]) == Some(0)
+}
+
+fn delete_task(name: &str) -> bool {
+    run_schtasks(&["/Delete", "/F", "/TN", name]) == Some(0) || !task_exists(name)
+}
+
+// ───────────────────────── elevation & install location ─────────────────────────
+
+/// Whether this process runs with administrator rights (needed for ETW).
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut e = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut e as *mut _ as *mut c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && e.TokenIsElevated != 0
+    }
+}
+
+/// Whether the exe lives under Program Files — a folder only administrators can write to.
+///
+/// The scheduled tasks start the exe elevated with no prompt. That's only safe when an
+/// ordinary program can't replace the exe first; from Downloads or the Desktop, malware
+/// could swap it and be handed admin rights silently at the next sign-in.
+pub fn is_installed() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = exe.to_string_lossy().to_lowercase();
+    [FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86].iter().any(|id| unsafe {
+        let Ok(p) = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None) else { return false };
+        let dir = p.to_string().unwrap_or_default().to_lowercase();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        !dir.is_empty() && exe.starts_with(&format!("{}\\", dir.trim_end_matches('\\')))
+    })
+}
+
+/// Called when started without admin rights. Hands off to an elevated copy and returns true
+/// (the caller should exit), or returns false to carry on unelevated.
+///
+/// Installed: runs the launch task — elevated, no prompt. Otherwise (or if that fails): the
+/// usual UAC prompt. Saying "No" to it also returns true, so nothing starts.
+pub fn relaunch_elevated(args: &[String]) -> bool {
+    unsafe {
+        // Let the elevated copy bring its settings window to the front.
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    if is_installed() && run_schtasks(&["/Run", "/TN", LAUNCH_TASK_NAME]) == Some(0) {
+        return true;
+    }
+
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = wide(&exe.display().to_string());
+    let params = args.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(" ");
+    let params = wide(&params);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(exe.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    match unsafe { ShellExecuteExW(&mut info) } {
+        Ok(()) => true,
+        Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => true,
+        Err(e) => {
+            // E.g. a standard user with UAC switched off: no way to elevate. Run anyway so
+            // the window explains that frame timings can't be read.
+            log(&format!("Could not relaunch elevated: {e}"));
+            false
+        }
+    }
+}
+
+/// Creates (or replaces) one of the app's scheduled tasks: highest privileges, current
+/// user, this exe. `at_logon` adds the sign-in trigger; without it the task only runs on
+/// demand, and several runs may overlap (a second copy just signals the first).
+fn register_task(name: &str, description: &str, at_logon: bool, args: &str) -> bool {
+    if !is_installed() {
+        log(&format!("Not registering \"{name}\": the app isn't installed under Program Files."));
+        return false;
     }
 
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
@@ -242,13 +368,20 @@ pub fn startup_set_enabled(enabled: bool) -> bool {
         _ => String::new(),
     };
     let (user, exe) = (xml_escape(&user), xml_escape(&exe));
+    let triggers = if at_logon {
+        format!(
+            "\n  <Triggers>\n    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT10S</Delay></LogonTrigger>\n  </Triggers>"
+        )
+    } else {
+        String::new()
+    };
+    let policy = if at_logon { "IgnoreNew" } else { "Parallel" };
+    let args = if args.is_empty() { String::new() } else { format!("<Arguments>{}</Arguments>", xml_escape(args)) };
+    let description = xml_escape(description);
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Starts the FPS Viewer overlay when you sign in.</Description></RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT10S</Delay></LogonTrigger>
-  </Triggers>
+  <RegistrationInfo><Description>{description}</Description></RegistrationInfo>{triggers}
   <Principals>
     <Principal id="Author">
       <UserId>{user}</UserId>
@@ -257,7 +390,7 @@ pub fn startup_set_enabled(enabled: bool) -> bool {
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>{policy}</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
@@ -269,24 +402,29 @@ pub fn startup_set_enabled(enabled: bool) -> bool {
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
-    <Exec><Command>{exe}</Command><Arguments>--background</Arguments></Exec>
+    <Exec><Command>{exe}</Command>{args}</Exec>
   </Actions>
 </Task>
 "#
     );
 
-    let tmp = std::env::temp_dir().join(format!("fpsviewer-task-{}.xml", std::process::id()));
+    // Written next to the exe (admin-only, checked above), not to %TEMP%: an unelevated
+    // program could swap a file in the user's temp folder before schtasks reads it.
+    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) else {
+        return false;
+    };
+    let tmp = dir.join(format!(".task-{}.xml", std::process::id()));
     let mut bytes = Vec::with_capacity(xml.len() * 2 + 2);
     bytes.extend_from_slice(&[0xFF, 0xFE]); // UTF-16 LE BOM
     for u in xml.encode_utf16() {
         bytes.extend_from_slice(&u.to_le_bytes());
     }
     if let Err(e) = std::fs::write(&tmp, bytes) {
-        log(&format!("Could not write the startup task file: {e}"));
+        log(&format!("Could not write the task file: {e}"));
         return false;
     }
     let tmp_str = tmp.display().to_string();
-    let ok = run_schtasks(&["/Create", "/F", "/TN", TASK_NAME, "/XML", &tmp_str]) == Some(0);
+    let ok = run_schtasks(&["/Create", "/F", "/TN", name, "/XML", &tmp_str]) == Some(0);
     let _ = std::fs::remove_file(&tmp);
     ok
 }

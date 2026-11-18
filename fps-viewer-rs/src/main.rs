@@ -26,7 +26,30 @@ use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, ReleaseMutex
 fn main() {
     std::panic::set_hook(Box::new(|info| util::log(&format!("Fatal: {info}"))));
 
-    let background = std::env::args().skip(1).any(|a| a.eq_ignore_ascii_case("--background"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a.eq_ignore_ascii_case(flag));
+
+    // Used by the installer, which runs elevated. Exit code 0 = success.
+    if has("--install") {
+        let mut ok = sys::launcher_register();
+        if has("--startup") {
+            ok &= sys::startup_set_enabled(true);
+        } else if has("--no-startup") {
+            ok &= sys::startup_set_enabled(false);
+        }
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    if has("--uninstall") {
+        std::process::exit(if sys::remove_tasks() { 0 } else { 1 });
+    }
+
+    // The exe starts as the user; reading frame timings needs admin rights. Hand off to an
+    // elevated copy — silently through the launch task when installed, else via UAC.
+    if !sys::is_elevated() && sys::relaunch_elevated(&args) {
+        return;
+    }
+
+    let background = has("--background");
 
     unsafe {
         // Single instance: a second launch just brings up the running instance's settings.

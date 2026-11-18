@@ -1,0 +1,95 @@
+# Publishes a GitHub Release whenever the production branch moves.
+#
+#   1. bump `version` in fps-viewer-rs/Cargo.toml and add a "## [x.y.z]" section to CHANGELOG.md
+#   2. merge main into production and push
+#
+# The run builds on Windows, packages the portable exe and the installer, tags the commit
+# vX.Y.Z and creates the release with that CHANGELOG section as its notes. It refuses to
+# run if vX.Y.Z already exists, so a version is never silently replaced.
+name: Release
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: fps-viewer-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for the "already released?" check and the changelog link
+
+      - name: Check version
+        id: ver
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if (git tag --list "v$v") {
+            throw "v$v is already released. Bump 'version' in fps-viewer-rs/Cargo.toml (and add it to CHANGELOG.md) before pushing to production."
+          }
+          "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Release notes
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $lines = Get-Content ../CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($v))\]" | Select-Object -First 1).LineNumber
+          if (-not $start) { throw "CHANGELOG.md has no '## [$v]' section." }
+          $body = @()
+          for ($i = $start; $i -lt $lines.Count -and $lines[$i] -notmatch '^## '; $i++) { $body += $lines[$i] }
+          $prev = git describe --tags --abbrev=0 --match 'v*' 2>$null
+          $global:LASTEXITCODE = 0 # no earlier release is fine
+          $body += ''
+          $body += '### Downloads'
+          $body += ''
+          $body += '| File | What it is |'
+          $body += '|---|---|'
+          $body += '| **FpsViewer-Setup-x64.exe** | Recommended. Installs FPS Viewer, opens without UAC prompts, can start with Windows. |'
+          $body += '| **FpsViewer-x64.exe** | Portable. No install; asks for administrator rights each time it opens. |'
+          $body += '| SHA256SUMS.txt | Checksums to verify your download. |'
+          $body += ''
+          $body += '> Windows may show "Windows protected your PC" for a new, unsigned release: choose **More info → Run anyway**.'
+          if ($prev) { $body += ''; $body += "**Full changelog:** https://github.com/${{ github.repository }}/compare/$prev...v$v" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $body -join "`n" | Set-Content -Encoding utf8NoBOM dist/RELEASE_NOTES.md
+          Get-Content dist/RELEASE_NOTES.md
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fps-viewer-rs
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package (exe + installer)
+        run: ./installer/package.ps1
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: FPS Viewer ${{ steps.ver.outputs.version }}
+          body_path: fps-viewer-rs/dist/RELEASE_NOTES.md
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            fps-viewer-rs/dist/FpsViewer-Setup-x64.exe
+            fps-viewer-rs/dist/FpsViewer-x64.exe
+            fps-viewer-rs/dist/SHA256SUMS.txt

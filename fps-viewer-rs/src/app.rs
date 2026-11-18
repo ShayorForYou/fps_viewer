@@ -587,7 +587,11 @@ impl App {
         self.syncing_startup = true;
         self.change(|s| s.start_with_windows = !requested);
         self.syncing_startup = false;
-        self.tray.balloon("FPS Viewer", "Couldn't update the startup task.");
+        if requested && !sys::is_installed() {
+            self.tray.balloon("FPS Viewer", "Start with Windows needs the installed version. Run FPS Viewer Setup first.");
+        } else {
+            self.tray.balloon("FPS Viewer", "Couldn't update the startup task.");
+        }
     }
 
     fn on_startup_query(&mut self, enabled: bool) {
